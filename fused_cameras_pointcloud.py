@@ -54,6 +54,9 @@ PREDICT_HORIZON = 10.0   # seconds to look ahead
 PREDICT_DT      = 0.1    # time-step for forward projection (s)
 MIN_SPEED_PRED  = 0.05   # m/s — don't predict for nearly-stationary bodies
 
+# Save CSV after this many rows have accumulated
+CSV_FLUSH_INTERVAL = 20
+
 
 class CameraFrustum:
     """
@@ -241,7 +244,30 @@ if __name__ == "__main__":
         print("Try to open ZED", conf.serial_number)
         init_params.input = sl.InputType()
         if conf.communication_parameters.comm_type == sl.COMM_TYPE.LOCAL_NETWORK:
-            network_senders[conf.serial_number] = conf.serial_number
+            #network_senders[conf.serial_number] = conf.serial_number
+            # Read IP and port from JSON and open as a stream
+            ip   = conf.communication_parameters.ip_address
+            port = conf.communication_parameters.port
+
+            senders[conf.serial_number] = sl.Camera()
+            init_params.set_from_stream(ip, port)
+            status = senders[conf.serial_number].open(init_params)
+            if status > sl.ERROR_CODE.SUCCESS:
+                print("Error opening the camera", conf.serial_number, status)
+                del senders[conf.serial_number]
+                continue
+            status = senders[conf.serial_number].enable_positional_tracking(positional_tracking_parameters)
+            if status != sl.ERROR_CODE.SUCCESS:
+                print("Error enabling positional tracking for camera", conf.serial_number)
+                del senders[conf.serial_number]
+                continue
+            status = senders[conf.serial_number].enable_body_tracking(body_tracking_parameters)
+            if status != sl.ERROR_CODE.SUCCESS:
+                print("Error enabling body tracking for camera", conf.serial_number)
+                del senders[conf.serial_number]
+                continue
+            senders[conf.serial_number].start_publishing(communication_parameters)
+
         else:
             init_params.input = conf.input_type
             senders[conf.serial_number] = sl.Camera()
@@ -297,7 +323,8 @@ if __name__ == "__main__":
         uuid = sl.CameraIdentifier()
         uuid.serial_number = conf.serial_number
         print("Subscribing to", conf.serial_number, conf.communication_parameters.comm_type)
-        status = fusion.subscribe(uuid, conf.communication_parameters, conf.pose)
+        status = fusion.subscribe(uuid, communication_parameters, conf.pose)
+        #status = fusion.subscribe(uuid, conf.communication_parameters, conf.pose)
         if status != sl.FUSION_ERROR_CODE.SUCCESS:
             print("Unable to subscribe to", uuid.serial_number, status)
         else:
@@ -389,6 +416,16 @@ if __name__ == "__main__":
     fusion_ok = False
 
     rows = []
+    csv_columns = [
+        'transition_src', 'transition_dst', 'timestamp', 'body_id',
+        'pos_x', 'pos_y', 'pos_z', 'vel_x', 'vel_y', 'vel_z', 'speed',
+        'hdg_x', 'hdg_z', 'transition_time',
+        'transition_entry_x', 'transition_entry_y', 'transition_entry_z',
+        'transition_prob', 'transition_approach',
+        'transition_time_err', 'transition_pos_err',
+    ]
+    csv_path = 'fused_tracking_data.csv'
+    rows_since_flush = 0
 
     while viewer.is_available():
         fusion_ok = fusion.process() == sl.FUSION_ERROR_CODE.SUCCESS
@@ -523,6 +560,12 @@ if __name__ == "__main__":
                                 'transition_time_err': None,
                                 'transition_pos_err': None,
                             })
+                            rows_since_flush += 1
+                            if rows_since_flush >= CSV_FLUSH_INTERVAL:
+                                df = pd.DataFrame(rows, columns=csv_columns)
+                                df.to_csv(csv_path, index=False)
+                                rows_since_flush = 0
+                                print(f"  💾 CSV saved ({len(rows)} rows total)")
 
         # ── Validate predictions against actual camera transitions ────────
         if fusion_ok:

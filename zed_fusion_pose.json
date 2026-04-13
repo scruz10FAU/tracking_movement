@@ -1,0 +1,44 @@
+{
+    "45626933": {
+        "FusionConfiguration": {
+            "communication_parameters": {
+                "CommunicationParameters": {
+                    "communication_type": "LOCAL NETWORK",
+                    "ip_add": "127.0.0.1",
+                    "ip_port": 30000
+                }
+            },
+            "input_type": {
+                "InputType": {
+                    "input": "",
+                    "input_type_conf": "45626933",
+                    "input_type_input": "GMSL SERIAL"
+                }
+            },
+            "override_gravity": false,
+            "pose": "-0.999997 -0.000000 -0.002580 -0.084638 0.000000 1.000000 -0.000240 -0.030434 0.002580 -0.000240 -0.999997 0.017819 0.000000 0.000000 0.000000 1.000000",
+            "serial_number": 45626933
+        }
+    },
+    "49123828": {
+        "FusionConfiguration": {
+            "communication_parameters": {
+                "CommunicationParameters": {
+                    "communication_type": "LOCAL NETWORK",
+                    "ip_add": "127.0.0.1",
+                    "ip_port": 30002
+                }
+            },
+            "input_type": {
+                "InputType": {
+                    "input": "",
+                    "input_type_conf": "49123828",
+                    "input_type_input": "GMSL SERIAL"
+                }
+            },
+            "override_gravity": false,
+            "pose": "-0.999997 -0.000000 -0.002480 -0.084532 0.000000 1.000000 -0.000240 0.123489 0.002480 -0.000240 -0.999997 0.015833 0.000000 0.000000 0.000000 1.000000",
+            "serial_number": 49123828
+        }
+    }
+}

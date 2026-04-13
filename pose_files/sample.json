@@ -1,0 +1,26 @@
+{
+    "units": "m",
+    "apply_axis_flip": true,
+    "cameras": [
+        {
+            "serial_number": 45626933,
+            "translation": [0.0, 0.0, 0.0],
+            "rotation_type": "quat",
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "input_type": "GMSL SERIAL",
+            "communication_type": "INTRA PROCESS",
+            "ip_add": "",
+            "ip_port": 0
+        },
+        {
+            "serial_number": 49123828,
+            "translation": [0.356969, 0.0, 0.147861],
+            "rotation_type": "euler",
+            "rotation": [0.0, 45.0, 0.0],
+            "input_type": "GMSL SERIAL",
+            "communication_type": "INTRA PROCESS",
+            "ip_add": "",
+            "ip_port": 0
+        }
+    ]
+}

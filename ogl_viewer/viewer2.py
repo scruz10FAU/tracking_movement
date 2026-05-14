@@ -527,6 +527,8 @@ class GLViewer:
         self._mouse_button = -1
         self._last_mouse_x = 0
         self._last_mouse_y = 0
+        self._bev_mode = False            # whether top-down BEV is active
+        self._saved_view = None           # (azimuth, elevation, distance, target) before BEV
 
     def init(self, camera_calibration=None):
         glutInit()
@@ -836,8 +838,24 @@ class GLViewer:
             self.cam_distance  = 5.0
             self.cam_target    = [0.0, 0.0, 0.0]
             self._compute_orbit_mvp()
-        elif ord(key) == 116:  # t — snap to top-down view
-            self.setup_top_down_view(height=self.cam_distance)
+        elif ord(key) == 116:  # t — toggle top-down BEV view
+            if self._bev_mode:
+                # Restore the view that was active before entering BEV
+                az, el, dist, tgt = self._saved_view
+                self.cam_azimuth   = az
+                self.cam_elevation = el
+                self.cam_distance  = dist
+                self.cam_target    = list(tgt)
+                self._bev_mode = False
+                self._compute_orbit_mvp()
+            else:
+                # Save current view then snap to top-down
+                self._saved_view = (
+                    self.cam_azimuth, self.cam_elevation,
+                    self.cam_distance, list(self.cam_target)
+                )
+                self.setup_top_down_view(height=self.cam_distance)
+                self._bev_mode = True
 
     def draw_callback(self):
         if self.available:

@@ -19,33 +19,36 @@
 ########################################################################
 
 """
-Fused multi-camera body tracking with point cloud + skeleton overlay.
-Top-down GL window shows the merged point cloud from all cameras with
-3-D skeleton bones drawn on top.  A separate OpenCV window shows each
-camera's 2-D feed with skeleton overlay for reference.
+Fused multi-camera body tracking with bird's-eye-view display.
+A top-down OpenCV window shows camera positions, FOV cones, tracked
+bodies, velocity arrows, and transition predictions projected onto the
+ground plane.  A second OpenCV window shows each camera's 2-D feed
+with skeleton overlay for reference.
 
 Usage:
-    python fused_cameras_pointcloud.py <fusion_config.json>
+    python fused_cameras_bev_image.py <fusion_config.json>
 """
 
 import cv2
 import sys
+import os
 import math
 import time
 import pyzed.sl as sl
 import threading
-import ogl_viewer.viewer2 as gl
 import cv_viewer.tracking_viewer as cv_viewer
 import numpy as np
 import pandas as pd
+import signal
 
-# Retrieve point clouds at this resolution to keep data volume manageable
-PC_WIDTH  = 640
-PC_HEIGHT = 360
+def cleanup(sig, frame):
+    global running, capture_running
+    print("Shutting down cleanly...")
+    running = False
+    capture_running = False
 
-# Subsample the point cloud further in numpy (1 = no extra subsampling)
-PC_DOWNSAMPLE = 1
-
+signal.signal(signal.SIGINT, cleanup)
+signal.signal(signal.SIGTERM, cleanup)
 # Reject points beyond this depth from the camera (metres)
 MAX_DEPTH = 12.0
 
@@ -55,7 +58,25 @@ PREDICT_DT      = 0.1    # time-step for forward projection (s)
 MIN_SPEED_PRED  = 0.05   # m/s — don't predict for nearly-stationary bodies
 
 # Save CSV after this many rows have accumulated
-CSV_FLUSH_INTERVAL = 20
+CSV_FLUSH_INTERVAL = 100
+
+# ── Bird's-eye view constants ──────────────────────────────────────────────
+BEV_PIXELS_PER_METRE = 40  # uniform px/m for both axes — preserves true FOV angles; tune to scale up/down
+BEV_DEPTH_TOLERANCE  = 0.85  # skip BEV pixels where actual depth < expected_floor_depth * this (removes object stretching)
+BEV_WIDTH  = 500           # fallback only (used as _w2b default; dynamic size set at runtime)
+BEV_HEIGHT = 500           # fallback only
+BEV_RANGE  = 10.0          # metres visible from the world-origin in each direction
+BEV_FRAME_SKIP = 3         # redraw BEV every Nth fusion frame to reduce CPU load
+# Y coordinate of the floor plane in world space.
+# None  → auto-detect from tracked body positions (recommended).
+# float → fix the plane at that Y (e.g. BEV_FLOOR_Y = -2.5).
+# With set_as_static=True the world origin is at the camera's initial pose,
+# so y=0 may be the ceiling if cameras are ceiling-mounted.
+BEV_FLOOR_Y = None    # None = auto-detect from body positions.
+                      # Or set a float to pin the floor plane (tune with [ / ] keys at runtime).
+
+_BEV_CAM_COLORS  = [(100, 100, 255), (255, 100, 100), (100, 255, 100), (255, 255, 100)]
+_BEV_BODY_COLORS = [(0, 255, 0), (0, 255, 255), (255, 0, 255), (255, 165, 0)]
 
 
 class CameraFrustum:
@@ -205,10 +226,310 @@ def get_dynamic_source_sn(body_id, pos, curr_visibility, last_map, camera_frustu
     return infer_source_sn_from_fused_pos(pos, camera_frustums)
 
 
+def _w2b(x, z, cx, cz, rng_x, rng_z, w=BEV_WIDTH, h=BEV_HEIGHT):
+    """World (x, z) → BEV pixel. Separate half-ranges for X and Z avoid wasted space."""
+    px = int(np.clip(((x - cx) / rng_x + 1.0) * 0.5 * w, 0, w - 1))
+    py = int(np.clip((1.0 - (z - cz) / rng_z) * 0.5 * h, 0, h - 1))
+    return px, py
+
+
+def compute_viewport(camera_frustums):
+    """
+    Compute separate X and Z half-ranges from the actual FOV footprints on the floor.
+    Returns (cx, cz, rng_x, rng_z).
+    Using the full FOV corners (not just camera positions + MAX_DEPTH) prevents
+    lateral clipping on wide-FOV cameras spread along X.
+    """
+    all_x = []
+    all_z = []
+    MARGIN = 2.0  # metres of padding around the footprint
+
+    for fr in camera_frustums.values():
+        all_x.append(float(fr.t[0]))
+        all_z.append(float(fr.t[2]))
+        # Forward vector in world space: R_inv.T == R, so R @ [0,0,-1]
+        fwd = fr.R_inv.T @ np.array([0.0, 0.0, -1.0])
+        fx, fz = float(fwd[0]), float(fwd[2])
+        flen = math.sqrt(fx * fx + fz * fz)
+        if flen > 1e-6:
+            fx /= flen
+            fz /= flen
+            for sign in (-1.0, 1.0):
+                a  = sign * fr.h_half
+                ex = fx * math.cos(a) - fz * math.sin(a)
+                ez = fx * math.sin(a) + fz * math.cos(a)
+                all_x.append(fr.t[0] + ex * fr.max_depth)
+                all_z.append(fr.t[2] + ez * fr.max_depth)
+        else:
+            all_x.extend([fr.t[0] + fr.max_depth, fr.t[0] - fr.max_depth])
+            all_z.extend([fr.t[2] + fr.max_depth, fr.t[2] - fr.max_depth])
+
+    cx   = (min(all_x) + max(all_x)) / 2.0
+    cz   = (min(all_z) + max(all_z)) / 2.0
+    rng_x = (max(all_x) - min(all_x)) / 2.0 + MARGIN
+    rng_z = (max(all_z) - min(all_z)) / 2.0 + MARGIN
+    return cx, cz, rng_x, rng_z
+
+
+def precompute_bev_projection(camera_frustums, camera_intrinsics, img_w, img_h,
+                              floor_y=0.0, cx=0.0, cz=0.0, rng_x=BEV_RANGE, rng_z=BEV_RANGE,
+                              bev_w=BEV_WIDTH, bev_h=BEV_HEIGHT):
+    """
+    Precompute per-camera BEV→image lookup tables.  Because cameras are static
+    (set_as_static=True) the world→camera transform and the pixel projection
+    never change, so these only need recomputing when floor_y changes.
+
+    Returns a dict:  serial → (bev_flat_idx, img_u, img_v)
+      bev_flat_idx — int32 array of flat indices into the BEV canvas
+      img_u / img_v — int32 arrays: which image pixel to sample for each BEV pixel
+    Depth compositing (nearest camera wins) is resolved here, not per frame.
+    """
+    N = bev_w * bev_h
+    px_idx = np.arange(bev_w, dtype=np.float32)
+    py_idx = np.arange(bev_h, dtype=np.float32)
+    px_grid, py_grid = np.meshgrid(px_idx, py_idx)
+    wx = (px_grid / (0.5 * bev_w) - 1.0) * rng_x + cx
+    wz = (1.0 - py_grid / (0.5 * bev_h)) * rng_z + cz
+    pts_flat = np.stack(
+        [wx.ravel(), np.full(N, floor_y, dtype=np.float32), wz.ravel()], axis=1
+    )  # (N, 3)
+
+    # Per-pixel winner tracking
+    best_serial = np.full(N, -1,       dtype=np.int64)
+    best_depth  = np.full(N, np.inf,   dtype=np.float32)
+    best_u      = np.zeros(N,          dtype=np.int32)
+    best_v      = np.zeros(N,          dtype=np.int32)
+    contrib_count = np.zeros(N,        dtype=np.int32)
+
+    for serial, fr in camera_frustums.items():
+        if serial not in camera_intrinsics:
+            continue
+        fx_i, fy_i, cx_i, cy_i = camera_intrinsics[serial]
+
+        pts_c = (fr.R_inv @ (pts_flat - fr.t).T).T  # (N, 3)
+        z_c   = pts_c[:, 2]
+        depth = -z_c
+        valid = (z_c < -fr.min_depth) & (z_c >= -fr.max_depth)
+        safe  = np.where(valid, depth, 1.0)
+
+        u_int = np.rint(fx_i * ( pts_c[:, 0] / safe) + cx_i).astype(np.int32)
+        v_int = np.rint(fy_i * (-pts_c[:, 1] / safe) + cy_i).astype(np.int32)
+
+        in_bounds = (valid &
+                     (u_int >= 0) & (u_int < img_w) &
+                     (v_int >= 0) & (v_int < img_h))
+        contrib_count[in_bounds] += 1
+        update = in_bounds & (depth < best_depth)
+
+        best_serial[update] = serial
+        best_depth[update]  = depth[update]
+        best_u[update]      = u_int[update]
+        best_v[update]      = v_int[update]
+
+    # Group by camera so draw time is a simple per-camera image sample
+    result = {}
+    for serial in camera_frustums:
+        mask = best_serial == serial
+        if np.any(mask):
+            result[serial] = (
+                np.where(mask)[0].astype(np.int32),
+                best_u[mask],
+                best_v[mask],
+                best_depth[mask].astype(np.float32),  # expected floor depth for depth-masking
+            )
+
+    overlap_mask = np.where(contrib_count >= 2)[0].astype(np.int32)
+    return result, overlap_mask
+
+
+def draw_bird_eye_view(bodies, camera_poses, camera_frustums, transitions,
+                       images, depth_maps, image_locks, bev_maps, bev_overlap,
+                       bev_cx, bev_cz, bev_rng_x, bev_rng_z,
+                       bev_w=BEV_WIDTH, bev_h=BEV_HEIGHT):
+    """
+    Build and return a (BEV_HEIGHT × BEV_WIDTH × 3) uint8 bird's-eye-view image.
+
+    Viewport auto-fits to all camera positions + MAX_DEPTH so nothing is cropped.
+    Overlapping camera coverage is tinted yellow.
+    """
+    canvas = np.zeros((bev_h, bev_w, 3), np.uint8)
+
+    # ── Ground-plane pixel projection (uses precomputed lookup tables) ─────
+    canvas_flat = canvas.reshape(-1, 3)
+    for serial, (bev_idx, img_u, img_v, exp_depth) in bev_maps.items():
+        with image_locks[serial]:
+            img_data   = images[serial].get_data()
+            depth_data = depth_maps[serial].get_data()
+            if img_data is None:
+                continue
+            cam_img   = img_data.copy()
+            depth_raw = depth_data.copy() if depth_data is not None else None
+
+        if depth_raw is not None:
+            # ZED MEASURE.DEPTH returns float32; shape is (H, W) or (H, W, 1)
+            d = depth_raw[:, :, 0] if depth_raw.ndim == 3 else depth_raw
+            actual = d[img_v, img_u]
+            # Keep pixels where depth is unknown (NaN/inf) or close to expected floor depth.
+            # Pixels significantly closer than the floor belong to objects above it.
+            floor_mask = ~np.isfinite(actual) | (actual >= exp_depth * BEV_DEPTH_TOLERANCE)
+            valid_bev = bev_idx[floor_mask]
+            canvas_flat[valid_bev] = cam_img[img_v[floor_mask], img_u[floor_mask], :3]
+        else:
+            # No depth available — fall back to unmasked projection
+            canvas_flat[bev_idx] = cam_img[img_v, img_u, :3]
+
+    # ── Overlap tint: yellow highlight where >=2 cameras cover the same ground ─
+    if bev_overlap is not None and len(bev_overlap) > 0:
+        ov = canvas_flat[bev_overlap].astype(np.int16)
+        canvas_flat[bev_overlap] = np.clip(ov + [0, 60, 60], 0, 255).astype(np.uint8)
+
+    # ── Grid (world-aligned, 1 m spacing) ────────────────────────────────
+    for g in range(int(math.floor(bev_cx - bev_rng_x)),
+                   int(math.ceil( bev_cx + bev_rng_x)) + 1):
+        gx, _ = _w2b(g, bev_cz, bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+        cv2.line(canvas, (gx, 0), (gx, bev_h - 1), (60, 60, 60), 1)
+    for g in range(int(math.floor(bev_cz - bev_rng_z)),
+                   int(math.ceil( bev_cz + bev_rng_z)) + 1):
+        _, gz = _w2b(bev_cx, g, bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+        cv2.line(canvas, (0, gz), (bev_w - 1, gz), (60, 60, 60), 1)
+
+    # HUD
+    cv2.putText(canvas,
+                f"X±{bev_rng_x:.1f}m  Z±{bev_rng_z:.1f}m  ctr=({bev_cx:+.1f},{bev_cz:+.1f})",
+                (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+    cv2.putText(canvas, "overlap", (4, bev_h - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 200), 1)
+
+    # Axis labels
+    _, oy = _w2b(bev_cx, bev_cz, bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+    cv2.putText(canvas, "+X", (bev_w - 28, oy - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+    ox, _ = _w2b(bev_cx, bev_cz, bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+    cv2.putText(canvas, "+Z", (ox + 4, 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+
+    # ── Cameras ───────────────────────────────────────────────────────────
+    for idx, (serial, fr) in enumerate(camera_frustums.items()):
+        col  = _BEV_CAM_COLORS[idx % len(_BEV_CAM_COLORS)]
+        cam_wx = float(fr.t[0])
+        cam_wz = float(fr.t[2])
+        cp = _w2b(cam_wx, cam_wz, bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+
+        cv2.circle(canvas, cp, 8, col, -1)
+        cv2.putText(canvas, f"CAM {serial}", (cp[0] + 10, cp[1] + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
+
+        if serial in camera_poses:
+            R   = camera_poses[serial][:3, :3]
+            fwd = R @ np.array([0.0, 0.0, -1.0], np.float32)
+            fx, fz = float(fwd[0]), float(fwd[2])
+            flen = math.sqrt(fx * fx + fz * fz)
+            if flen > 1e-6:
+                fx /= flen
+                fz /= flen
+                cone_len = fr.max_depth
+
+                for sign in (-1.0, 1.0):
+                    a = sign * fr.h_half
+                    cos_a, sin_a = math.cos(a), math.sin(a)
+                    ex = fx * cos_a - fz * sin_a
+                    ez = fx * sin_a + fz * cos_a
+                    ep = _w2b(cam_wx + ex * cone_len, cam_wz + ez * cone_len,
+                              bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+                    cv2.line(canvas, cp, ep, col, 1)
+
+                arc_pts = []
+                for a in np.linspace(-fr.h_half, fr.h_half, 30):
+                    cos_a, sin_a = math.cos(a), math.sin(a)
+                    ex = fx * cos_a - fz * sin_a
+                    ez = fx * sin_a + fz * cos_a
+                    arc_pts.append(_w2b(cam_wx + ex * cone_len, cam_wz + ez * cone_len,
+                                        bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h))
+                for i in range(len(arc_pts) - 1):
+                    cv2.line(canvas, arc_pts[i], arc_pts[i + 1], col, 1)
+
+    # ── Inter-camera distances ────────────────────────────────────────────
+    sns = list(camera_frustums.keys())
+    for i in range(len(sns)):
+        for j in range(i + 1, len(sns)):
+            fa = camera_frustums[sns[i]]
+            fb = camera_frustums[sns[j]]
+            ax, ay, az = float(fa.t[0]), float(fa.t[1]), float(fa.t[2])
+            bx, by, bz = float(fb.t[0]), float(fb.t[1]), float(fb.t[2])
+
+            pa = _w2b(ax, az, bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+            pb = _w2b(bx, bz, bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+            mid = ((pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2)
+
+            d_horiz = math.sqrt((ax - bx) ** 2 + (az - bz) ** 2)
+            d_vert  = abs(ay - by)
+            d_3d    = math.sqrt(d_horiz ** 2 + d_vert ** 2)
+
+            cv2.line(canvas, pa, pb, (200, 200, 200), 1, cv2.LINE_AA)
+
+            cv2.putText(canvas, f"H:{d_horiz:.2f}m",
+                        (mid[0] + 4, mid[1] - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"V:{d_vert:.2f}m",
+                        (mid[0] + 4, mid[1] - 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"3D:{d_3d:.2f}m",
+                        (mid[0] + 4, mid[1] + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # ── Tracked bodies ────────────────────────────────────────────────────
+    for b in bodies.body_list:
+        if b.tracking_state == sl.OBJECT_TRACKING_STATE.TERMINATE:
+            continue
+
+        col = _BEV_BODY_COLORS[b.id % len(_BEV_BODY_COLORS)]
+        p   = b.position
+        bx, bz = float(p[0]), float(p[2])
+        bp  = _w2b(bx, bz, bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+
+        cv2.circle(canvas, bp, 10, col, -1)
+        cv2.putText(canvas, f"#{b.id}", (bp[0] + 12, bp[1] + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+
+        v = b.velocity
+        vx, vz = float(v[0]), float(v[2])
+        spd_2d = math.sqrt(vx * vx + vz * vz)
+        if spd_2d > MIN_SPEED_PRED:
+            vel_ep = _w2b(bx + vx * 2.0, bz + vz * 2.0,
+                          bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+            cv2.arrowedLine(canvas, bp, vel_ep, col, 2, tipLength=0.3)
+
+        _, _, spd_w, hdg = _body_info(b)
+        if hdg:
+            hx, hz = hdg
+            hp = _w2b(bx + hx * 0.8, bz + hz * 0.8,
+                      bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+            cv2.line(canvas, bp, hp, (255, 255, 255), 2)
+
+        cv2.putText(canvas, f"{spd_w:.1f}m/s",
+                    (bp[0] + 12, bp[1] + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1, cv2.LINE_AA)
+
+        if b.id in transitions:
+            for _src_s, _dst_s, t_e, ep_w, prob, _appr in transitions[b.id]:
+                if ep_w is not None and prob > 0.3:
+                    ep_px = _w2b(float(ep_w[0]), float(ep_w[2]),
+                                 bev_cx, bev_cz, bev_rng_x, bev_rng_z, bev_w, bev_h)
+                    cv2.arrowedLine(canvas, bp, ep_px, (255, 200, 100), 1,
+                                    tipLength=0.2)
+                    if t_e is not None:
+                        cv2.putText(canvas, f"{t_e:.1f}s",
+                                    (ep_px[0] + 4, ep_px[1] - 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+                                    (255, 200, 100), 1, cv2.LINE_AA)
+
+    return canvas
+
+
 if __name__ == "__main__":
 
     if len(sys.argv) < 2:
-        print("Usage: python fused_cameras_pointcloud.py <fusion_config_file>")
+        print("Usage: python fused_cameras_bev.py <fusion_config_file>")
         exit(1)
 
     filepath = sys.argv[1]
@@ -225,8 +546,9 @@ if __name__ == "__main__":
     init_params = sl.InitParameters()
     init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
     init_params.coordinate_units  = sl.UNIT.METER
-    init_params.depth_mode         = sl.DEPTH_MODE.NEURAL
-    init_params.camera_resolution  = sl.RESOLUTION.HD1080
+    #init_params.depth_mode         = sl.DEPTH_MODE.NEURAL
+    init_params.depth_mode         = sl.DEPTH_MODE.NEURAL_LIGHT
+    init_params.camera_resolution  = sl.RESOLUTION.SVGA
 
     communication_parameters = sl.CommunicationParameters()
     communication_parameters.set_for_shared_memory()
@@ -238,7 +560,7 @@ if __name__ == "__main__":
     body_tracking_parameters.detection_model     = sl.BODY_TRACKING_MODEL.HUMAN_BODY_ACCURATE
     body_tracking_parameters.body_format         = sl.BODY_FORMAT.BODY_18
     body_tracking_parameters.enable_body_fitting = False
-    body_tracking_parameters.enable_tracking     = False
+    body_tracking_parameters.enable_tracking     = True   # temporal persistence helps keypoint association
 
     for conf in fusion_configurations:
         print("Try to open ZED", conf.serial_number)
@@ -341,7 +663,7 @@ if __name__ == "__main__":
     fusion.enable_body_tracking(body_tracking_fusion_params)
 
     rt = sl.BodyTrackingFusionRuntimeParameters()
-    rt.skeleton_minimum_allowed_keypoints = 7
+    rt.skeleton_minimum_allowed_keypoints = 4   # balance: catches partial detections without false-positiving on objects
 
     # Build camera-to-world pose matrices
     camera_poses = {}
@@ -367,18 +689,63 @@ if __name__ == "__main__":
     native_res     = camera_info.camera_configuration.resolution
     display_resolution = sl.Resolution(min(native_res.width, 1280), min(native_res.height, 720))
     image_scale = [display_resolution.width / native_res.width, display_resolution.height / native_res.height]
-    pc_resolution = sl.Resolution(PC_WIDTH, PC_HEIGHT)
 
-    viewer = gl.GLViewer()
-    viewer.init()
-    print("GL viewer controls:  t = toggle bird's-eye view  |  r = reset view  |  q/Esc = quit")
+    # Build intrinsics scaled to display_resolution for every sender camera.
+    # Each camera may have a different native resolution so scale individually.
+    camera_intrinsics = {}
+    for serial, zed in senders.items():
+        if serial not in camera_poses:
+            continue
+        info  = zed.get_camera_information()
+        calib = info.camera_configuration.calibration_parameters
+        cam_native = info.camera_configuration.resolution
+        sx = display_resolution.width  / cam_native.width
+        sy = display_resolution.height / cam_native.height
+        camera_intrinsics[serial] = (
+            calib.left_cam.fx * sx,
+            calib.left_cam.fy * sy,
+            calib.left_cam.cx * sx,
+            calib.left_cam.cy * sy,
+        )
+
+    # Print camera world positions — Y tells us which direction is "up" at runtime.
+    print("Camera world positions (runtime coordinate frame):")
+    for serial, fr in camera_frustums.items():
+        print(f"  Camera {serial}: X={fr.t[0]:+.3f}  Y={fr.t[1]:+.3f}  Z={fr.t[2]:+.3f} m")
+
+    bev_cx, bev_cz, bev_rng_x, bev_rng_z = compute_viewport(camera_frustums)
+    print(f"BEV viewport: centre=({bev_cx:+.2f}, {bev_cz:+.2f}) m  "
+          f"X±{bev_rng_x:.2f} m  Z±{bev_rng_z:.2f} m")
+    # Compute canvas dimensions using a uniform px/m scale so FOV angles are undistorted.
+    _bev_w = max(200, int(round(2 * bev_rng_x * BEV_PIXELS_PER_METRE)))
+    _bev_h = max(200, int(round(2 * bev_rng_z * BEV_PIXELS_PER_METRE)))
+    print(f"BEV canvas: {_bev_w}×{_bev_h} px  ({BEV_PIXELS_PER_METRE} px/m uniform scale)")
+
+    # Default floor_y: start 1 m below the lowest camera Y.
+    # With some SDK coordinate transforms the cameras end up at negative Y,
+    # so anchoring relative to camera Y avoids the floor plane being above them.
+    _cam_y_values = [float(fr.t[1]) for fr in camera_frustums.values()]
+    _default_floor_y = min(_cam_y_values) - 1.0
+    _bev_floor_y = BEV_FLOOR_Y if BEV_FLOOR_Y is not None else _default_floor_y
+    print(f"Initial floor_y = {_bev_floor_y:+.3f} m  "
+          f"(camera Y range: {min(_cam_y_values):+.3f} to {max(_cam_y_values):+.3f})  "
+          f"Use [ / ] to adjust")
+    bev_maps, bev_overlap = precompute_bev_projection(
+        camera_frustums, camera_intrinsics,
+        display_resolution.width, display_resolution.height,
+        floor_y=_bev_floor_y,
+        cx=bev_cx, cz=bev_cz, rng_x=bev_rng_x, rng_z=bev_rng_z,
+        bev_w=_bev_w, bev_h=_bev_h,
+    )
+    print(f"BEV projection precomputed — floor_y={_bev_floor_y:.2f}m, "
+          f"{len(bev_maps)} camera(s), {len(bev_overlap)} overlap pixels."
+          + ("  [auto-detect active]" if BEV_FLOOR_Y is None else ""))
 
     bodies        = sl.Bodies()
     single_bodies = {cam.serial_number: sl.Bodies() for cam in camera_identifiers}
     images        = {serial: sl.Mat() for serial in senders}
-    pc_mats       = {serial: sl.Mat() for serial in senders}
+    depth_maps    = {serial: sl.Mat() for serial in senders}
     image_locks   = {serial: threading.Lock() for serial in senders}
-    pc_locks      = {serial: threading.Lock() for serial in senders}
     camera_ready  = {serial: threading.Event() for serial in senders}
     capture_running = True
 
@@ -389,8 +756,7 @@ if __name__ == "__main__":
                 zed.retrieve_bodies(local_bodies)
                 with image_locks[serial]:
                     zed.retrieve_image(images[serial], sl.VIEW.LEFT, sl.MEM.CPU, display_resolution)
-                with pc_locks[serial]:
-                    zed.retrieve_measure(pc_mats[serial], sl.MEASURE.XYZRGBA, sl.MEM.CPU, pc_resolution)
+                    zed.retrieve_measure(depth_maps[serial], sl.MEASURE.DEPTH, sl.MEM.CPU, display_resolution)
                 camera_ready[serial].set()
 
     threads = []
@@ -404,8 +770,20 @@ if __name__ == "__main__":
         if not event.wait(timeout=10.0):
             print(f"Warning: camera {serial} did not produce a frame within 10 s")
 
+    # Set up windows — WINDOW_NORMAL makes them draggable and resizable
+    cv2.namedWindow("Bird's Eye View", cv2.WINDOW_NORMAL)
+    cv2.moveWindow("Bird's Eye View", 0, 0)
+    # No resizeWindow for BEV — it auto-sizes to fit all camera FOVs
+
+    cv2.namedWindow("Camera Feeds", cv2.WINDOW_NORMAL)
+    cv2.moveWindow("Camera Feeds", 0, 520)
+    cv2.resizeWindow("Camera Feeds", 1280, 400)
+
     _last_print  = 0.0
     _transitions = {}
+    _bev_frame   = 0
+    _last_bev    = None
+    _bev_floor_y_samples = []   # rolling body-Y samples for floor auto-detection
 
     _pending_predictions = {}  # body_id -> {dst_serial: (pred_abs_time, pred_entry_pos)}
     _prev_visibility = {}      # body_id -> set(serials)
@@ -428,13 +806,35 @@ if __name__ == "__main__":
     csv_path = 'fused_tracking_data.csv'
     rows_since_flush = 0
 
-    while viewer.is_available():
+    running = True
+    while running:
         fusion_ok = fusion.process() == sl.FUSION_ERROR_CODE.SUCCESS
         if fusion_ok:
             fusion.retrieve_bodies(bodies, rt)
-            viewer.update_bodies(bodies)
             for cam in camera_identifiers:
                 fusion.retrieve_bodies(single_bodies[cam.serial_number], rt, cam)
+
+        # ── Auto floor-Y detection ────────────────────────────────────────
+        # Collect body Y positions; body.position[1] is roughly hip/waist height
+        # (~1 m above the floor), so floor ≈ min(body_y) - 1.0.
+        if BEV_FLOOR_Y is None:
+            for b in bodies.body_list:
+                if b.tracking_state != sl.OBJECT_TRACKING_STATE.TERMINATE:
+                    _bev_floor_y_samples.append(float(b.position[1]))
+            if len(_bev_floor_y_samples) >= 30:
+                estimated = min(_bev_floor_y_samples) - 1.0
+                _bev_floor_y_samples.clear()
+                if abs(estimated - _bev_floor_y) > 0.15:
+                    _bev_floor_y = estimated
+                    bev_maps, bev_overlap = precompute_bev_projection(
+                        camera_frustums, camera_intrinsics,
+                        display_resolution.width, display_resolution.height,
+                        floor_y=_bev_floor_y,
+                        cx=bev_cx, cz=bev_cz, rng_x=bev_rng_x, rng_z=bev_rng_z,
+                        bev_w=_bev_w, bev_h=_bev_h,
+                    )
+                    print(f"  [BEV] floor_y updated to {_bev_floor_y:+.2f} m  "
+                          f"(set BEV_FLOOR_Y = {_bev_floor_y:.2f} to pin this value)")
 
         # ── Terminal body-tracking report + transition prediction (1 Hz) ──
         now = time.time()
@@ -588,7 +988,7 @@ if __name__ == "__main__":
 
             # ALSO assign a source for tracked fused bodies NOT present in curr_visibility
             for fb in bodies.body_list:
-                
+
                 #if fb.tracking_state != sl.OBJECT_TRACKING_STATE.OK:
                 if fb.tracking_state == sl.OBJECT_TRACKING_STATE.TERMINATE:
                     continue
@@ -652,46 +1052,20 @@ if __name__ == "__main__":
                 if gone not in curr_visibility:
                     del _prev_visibility[gone]
 
-        # ── Point cloud ──────────────────────────────────────────────────
-        pc_list = []
-        for serial in senders:
-            with pc_locks[serial]:
-                raw = pc_mats[serial].get_data()
-                pc_copy = raw.copy() if raw is not None else None
-            if pc_copy is None:
-                continue
-
-            sub     = np.ascontiguousarray(pc_copy[::PC_DOWNSAMPLE, ::PC_DOWNSAMPLE])
-            pc_flat = sub.reshape(-1, 4).astype(np.float32)
-
-            z_col = pc_flat[:, 2]
-            valid = (
-                np.isfinite(pc_flat[:, 0]) &
-                np.isfinite(pc_flat[:, 1]) &
-                np.isfinite(z_col) &
-                (z_col < -0.1) &
-                (z_col > -MAX_DEPTH)
-            )
-            pc_valid = pc_flat[valid]
-            if len(pc_valid) == 0:
-                continue
-
-            xyz = np.ascontiguousarray(pc_valid[:, :3])
-
-            if serial in camera_poses:
-                pose = camera_poses[serial]
-                xyz = (pose[:3, :3] @ xyz.T).T + pose[:3, 3]
-
-            rgba_col  = np.ascontiguousarray(pc_valid[:, 3])
-            rgba_bits = rgba_col.view(np.uint32)
-            r_ch = (rgba_bits        & 0xFF).astype(np.float32) / 255.0
-            g_ch = ((rgba_bits >> 8) & 0xFF).astype(np.float32) / 255.0
-            b_ch = ((rgba_bits >>16) & 0xFF).astype(np.float32) / 255.0
-            rgba = np.ascontiguousarray(np.stack([r_ch, g_ch, b_ch, np.ones_like(r_ch)], axis=1))
-
-            pc_list.append((xyz.astype(np.float32), rgba))
-
-        viewer.update_point_clouds(pc_list)
+        # ── Bird's-eye view ───────────────────────────────────────────────
+        _bev_frame += 1
+        if _bev_frame % BEV_FRAME_SKIP == 0:
+            _last_bev = draw_bird_eye_view(bodies, camera_poses, camera_frustums,
+                                           _transitions, images, depth_maps, image_locks,
+                                           bev_maps, bev_overlap,
+                                           bev_cx, bev_cz, bev_rng_x, bev_rng_z,
+                                           bev_w=_bev_w, bev_h=_bev_h)
+        if _last_bev is not None:
+            cv2.imshow("Bird's Eye View", _last_bev)
+            # Auto-fit window to canvas size on first frame
+            if _bev_frame == BEV_FRAME_SKIP:
+                h, w = _last_bev.shape[:2]
+                cv2.resizeWindow("Bird's Eye View", w, h)
 
         # ── 2-D camera feed windows ──────────────────────────────────────
         fused_by_id = {b.id: b for b in bodies.body_list}
@@ -736,36 +1110,66 @@ if __name__ == "__main__":
                                 if src_s != serial:
                                     continue
                                 ep_str = (f"({ep[0]:+.1f},{ep[1]:+.1f},{ep[2]:+.1f})m" if ep is not None else "")
-                                pred_line = (f"→{dst_s} {t_e:.1f}s {ep_str} {appr:.1f}m/s P={prob:.0%}")
-                                cv2.putText(frame,
-                                    pred_line,
-                                    (nx, ny + 28), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.34, (255, 200, 100, 255), 1, cv2.LINE_AA)
+                                try:
+                                    pred_line = (f"→{dst_s} {t_e:.1f}s {ep_str} {appr:.1f}m/s P={prob:.0%}")
+                                    cv2.putText(frame,
+                                        pred_line,
+                                        (nx, ny + 28), cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.34, (255, 200, 100, 255), 1, cv2.LINE_AA)
+                                except Exception as e:
+                                    print(f"Error detecting; {e}")
 
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR))
 
         if frames:
             cv2.imshow("Camera Feeds", np.hstack(frames) if len(frames) > 1 else frames[0])
-        if cv2.waitKey(1) == ord('q'):
-            break
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            running = False
+        elif key == ord('['):
+            _bev_floor_y -= 0.1
+            bev_maps, bev_overlap = precompute_bev_projection(
+                camera_frustums, camera_intrinsics,
+                display_resolution.width, display_resolution.height,
+                floor_y=_bev_floor_y,
+                cx=bev_cx, cz=bev_cz, rng_x=bev_rng_x, rng_z=bev_rng_z,
+                bev_w=_bev_w, bev_h=_bev_h,
+            )
+            print(f"floor_y = {_bev_floor_y:+.2f} m  (set BEV_FLOOR_Y = {_bev_floor_y:.2f} to pin)")
+        elif key == ord(']'):
+            _bev_floor_y += 0.1
+            bev_maps, bev_overlap = precompute_bev_projection(
+                camera_frustums, camera_intrinsics,
+                display_resolution.width, display_resolution.height,
+                floor_y=_bev_floor_y,
+                cx=bev_cx, cz=bev_cz, rng_x=bev_rng_x, rng_z=bev_rng_z,
+                bev_w=_bev_w, bev_h=_bev_h,
+            )
+            print(f"floor_y = {_bev_floor_y:+.2f} m  (set BEV_FLOOR_Y = {_bev_floor_y:.2f} to pin)")
 
     capture_running = False
     for t in threads:
         t.join(timeout=2.0)
 
-    for sender in senders:
-        senders[sender].close()
-
-    df = pd.DataFrame(rows, columns=[
-        'transition_src', 'transition_dst','timestamp', 'body_id',
-        'pos_x', 'pos_y', 'pos_z',
-        'vel_x', 'vel_y', 'vel_z', 'speed',
-        'hdg_x', 'hdg_z', 'transition_time',
-        'transition_entry_x', 'transition_entry_y', 'transition_entry_z',
-        'transition_prob', 'transition_approach',
-        'transition_time_err', 'transition_pos_err',
-    ])
-    df.to_csv('fused_tracking_data.csv', index=False)
+    # Save CSV before any ZED teardown that might crash
+    try:
+        df = pd.DataFrame(rows, columns=[
+            'transition_src', 'transition_dst', 'timestamp', 'body_id',
+            'pos_x', 'pos_y', 'pos_z',
+            'vel_x', 'vel_y', 'vel_z', 'speed',
+            'hdg_x', 'hdg_z', 'transition_time',
+            'transition_entry_x', 'transition_entry_y', 'transition_entry_z',
+            'transition_prob', 'transition_approach',
+            'transition_time_err', 'transition_pos_err',
+        ])
+        df.to_csv('fused_tracking_data.csv', index=False)
+    except Exception as e:
+        print(f"Warning: CSV save failed: {e}")
 
     cv2.destroyAllWindows()
-    viewer.exit()
+
+    # ZED SDK close() calls touch CUDA, which Isaac SIM may have already torn down,
+    # causing a native SIGSEGV that try/except cannot catch.
+    # os._exit() terminates immediately — the OS releases all memory and handles.
+    os._exit(0)

@@ -36,7 +36,6 @@ import math
 import time
 import pyzed.sl as sl
 import threading
-import cv_viewer.tracking_viewer as cv_viewer
 import numpy as np
 import pandas as pd
 import signal
@@ -50,7 +49,7 @@ def cleanup(sig, frame):
 signal.signal(signal.SIGINT, cleanup)
 signal.signal(signal.SIGTERM, cleanup)
 # Reject points beyond this depth from the camera (metres)
-MAX_DEPTH = 12.0
+MAX_DEPTH = 20.0
 
 # Camera transition prediction settings
 PREDICT_HORIZON = 10.0   # seconds to look ahead
@@ -479,7 +478,7 @@ def draw_bird_eye_view(bodies, camera_poses, camera_frustums, transitions,
 
     # ── Tracked bodies ────────────────────────────────────────────────────
     for b in bodies.body_list:
-        if b.tracking_state == sl.OBJECT_TRACKING_STATE.TERMINATE:
+        if b.tracking_state != sl.OBJECT_TRACKING_STATE.OK:
             continue
 
         col = _BEV_BODY_COLORS[b.id % len(_BEV_BODY_COLORS)]
@@ -771,12 +770,12 @@ if __name__ == "__main__":
             print(f"Warning: camera {serial} did not produce a frame within 10 s")
 
     # Set up windows — WINDOW_NORMAL makes them draggable and resizable
+    _TITLE_BAR = 40  # approximate OS window title-bar height in pixels
     cv2.namedWindow("Bird's Eye View", cv2.WINDOW_NORMAL)
     cv2.moveWindow("Bird's Eye View", 0, 0)
-    # No resizeWindow for BEV — it auto-sizes to fit all camera FOVs
 
     cv2.namedWindow("Camera Feeds", cv2.WINDOW_NORMAL)
-    cv2.moveWindow("Camera Feeds", 0, 520)
+    cv2.moveWindow("Camera Feeds", 0, _bev_h + _TITLE_BAR)
     cv2.resizeWindow("Camera Feeds", 1280, 400)
 
     _last_print  = 0.0
@@ -819,7 +818,7 @@ if __name__ == "__main__":
         # (~1 m above the floor), so floor ≈ min(body_y) - 1.0.
         if BEV_FLOOR_Y is None:
             for b in bodies.body_list:
-                if b.tracking_state != sl.OBJECT_TRACKING_STATE.TERMINATE:
+                if b.tracking_state == sl.OBJECT_TRACKING_STATE.OK:
                     _bev_floor_y_samples.append(float(b.position[1]))
             if len(_bev_floor_y_samples) >= 30:
                 estimated = min(_bev_floor_y_samples) - 1.0
@@ -840,8 +839,7 @@ if __name__ == "__main__":
         now = time.time()
         if now - _last_print >= 1.0:
             _last_print = now
-            #tracked = [b for b in bodies.body_list if b.tracking_state == sl.OBJECT_TRACKING_STATE.OK]
-            tracked = [b for b in bodies.body_list if b.tracking_state != sl.OBJECT_TRACKING_STATE.TERMINATE]
+            tracked = [b for b in bodies.body_list if b.tracking_state == sl.OBJECT_TRACKING_STATE.OK]
             _transitions.clear()
 
             if tracked:
@@ -1062,62 +1060,101 @@ if __name__ == "__main__":
                                            bev_w=_bev_w, bev_h=_bev_h)
         if _last_bev is not None:
             cv2.imshow("Bird's Eye View", _last_bev)
-            # Auto-fit window to canvas size on first frame
+            # Auto-fit window to canvas size on first frame, then reposition Camera Feeds below it
             if _bev_frame == BEV_FRAME_SKIP:
                 h, w = _last_bev.shape[:2]
                 cv2.resizeWindow("Bird's Eye View", w, h)
+                cv2.moveWindow("Camera Feeds", 0, h + _TITLE_BAR)
 
         # ── 2-D camera feed windows ──────────────────────────────────────
-        fused_by_id = {b.id: b for b in bodies.body_list}
+        # Skeleton is drawn by projecting the fused 3-D keypoints (world frame)
+        # into each camera's image using the known pose geometry.  This gives the
+        # correct pixel position on every camera that can see the body, and avoids
+        # the assignment problem caused by fusion projecting all bodies into all
+        # camera image spaces regardless of visibility.
+        _SKEL_18 = [
+            (1, 0), (1, 2), (2, 3), (3, 4),
+            (1, 5), (5, 6), (6, 7),
+            (1, 8), (8, 9), (9, 10), (10, 11),
+            (8, 12), (12, 13), (13, 14),
+            (0, 15), (0, 16),
+        ]
+
+        def _proj(kp3d, R_inv, cam_t, fx_c, fy_c, cx_c, cy_c, w_img, h_img):
+            """Project one world-space keypoint to pixel coords; return None if invalid."""
+            if not (math.isfinite(kp3d[0]) and math.isfinite(kp3d[1]) and math.isfinite(kp3d[2])):
+                return None
+            p = R_inv @ (np.array([kp3d[0], kp3d[1], kp3d[2]], np.float32) - cam_t)
+            if p[2] >= -0.1:   # behind or at camera plane
+                return None
+            d = -p[2]
+            u = int(round(fx_c * (p[0] / d) + cx_c))
+            v = int(round(fy_c * (-p[1] / d) + cy_c))
+            if 0 <= u < w_img and 0 <= v < h_img:
+                return (u, v)
+            return None
 
         frames = []
-        for serial in senders:
+        for serial in sorted(senders, key=lambda s: camera_frustums[s].t[0] if s in camera_frustums else 0):
             with image_locks[serial]:
                 data  = images[serial].get_data()
                 frame = data.copy() if data is not None else None
             if frame is not None:
-                if serial in single_bodies:
-                    cv_viewer.render_2D(
-                        frame, image_scale,
-                        single_bodies[serial].body_list,
-                        False,
-                        body_tracking_parameters.body_format,
-                    )
-                    for body in single_bodies[serial].body_list:
-                        if len(body.keypoint_2d) < 2:
+                fr   = camera_frustums.get(serial)
+                intr = camera_intrinsics.get(serial)
+                if fr is not None and intr is not None:
+                    fx_c, fy_c, cx_c, cy_c = intr
+                    h_img, w_img = frame.shape[:2]
+
+                    for body in bodies.body_list:
+                        if body.tracking_state != sl.OBJECT_TRACKING_STATE.OK:
                             continue
-                        neck = body.keypoint_2d[1]
-                        nx = int(neck[0] * image_scale[0])
-                        ny = int(neck[1] * image_scale[1]) - 18
-                        h, w = frame.shape[:2]
-                        if not (5 <= nx < w - 5 and 10 <= ny < h - 5):
+                        if not fr.contains(body.position):
                             continue
-                        fb = fused_by_id.get(body.id)
-                        if fb is None:
-                            continue
-                        pos, vel, speed, hdg = _body_info(fb)
-                        cv2.putText(frame,
-                            f"#{fb.id} ({pos[0]:+.1f},{pos[1]:+.1f},{pos[2]:+.1f})m",
-                            (nx, ny), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.38, (255, 255, 255, 255), 1, cv2.LINE_AA)
-                        hdg_str = (f"hdg({hdg[0]:+.2f},{hdg[1]:+.2f})" if hdg else "")
-                        cv2.putText(frame,
-                            f"{speed:.2f}m/s {hdg_str}",
-                            (nx, ny + 14), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.38, (200, 255, 200, 255), 1, cv2.LINE_AA)
-                        if fb.id in _transitions:
-                            for src_s, dst_s, t_e, ep, prob, appr in _transitions[fb.id]:
-                                if src_s != serial:
-                                    continue
-                                ep_str = (f"({ep[0]:+.1f},{ep[1]:+.1f},{ep[2]:+.1f})m" if ep is not None else "")
-                                try:
-                                    pred_line = (f"→{dst_s} {t_e:.1f}s {ep_str} {appr:.1f}m/s P={prob:.0%}")
-                                    cv2.putText(frame,
-                                        pred_line,
-                                        (nx, ny + 28), cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.34, (255, 200, 100, 255), 1, cv2.LINE_AA)
-                                except Exception as e:
-                                    print(f"Error detecting; {e}")
+
+                        col = _BEV_BODY_COLORS[body.id % len(_BEV_BODY_COLORS)]
+
+                        # Project every 3-D keypoint into this camera's image
+                        kps = body.keypoint
+                        pts = [
+                            _proj(kps[i], fr.R_inv, fr.t, fx_c, fy_c, cx_c, cy_c, w_img, h_img)
+                            if i < len(kps) else None
+                            for i in range(18)
+                        ]
+
+                        # Draw bones
+                        for a, b_idx in _SKEL_18:
+                            if pts[a] and pts[b_idx]:
+                                cv2.line(frame, pts[a], pts[b_idx], col + (255,), 2, cv2.LINE_AA)
+
+                        # Draw joint dots
+                        for pt in pts:
+                            if pt:
+                                cv2.circle(frame, pt, 4, col + (255,), -1, cv2.LINE_AA)
+
+                        # Labels anchored to neck (keypoint 1)
+                        neck_pt = pts[1]
+                        if neck_pt:
+                            nx, ny = neck_pt[0], neck_pt[1] - 20
+                            pos, vel, speed, hdg = _body_info(body)
+                            cv2.putText(frame,
+                                f"#{body.id} ({pos[0]:+.1f},{pos[1]:+.1f},{pos[2]:+.1f})m",
+                                (nx, ny), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.38, (255, 255, 255, 255), 1, cv2.LINE_AA)
+                            hdg_str = (f"hdg({hdg[0]:+.2f},{hdg[1]:+.2f})" if hdg else "")
+                            cv2.putText(frame,
+                                f"{speed:.2f}m/s {hdg_str}",
+                                (nx, ny + 14), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.38, (200, 255, 200, 255), 1, cv2.LINE_AA)
+                            if body.id in _transitions:
+                                for src_s, dst_s, t_e, ep, prob, appr in _transitions[body.id]:
+                                    if t_e is not None:
+                                        ep_str = (f"({ep[0]:+.1f},{ep[1]:+.1f},{ep[2]:+.1f})m"
+                                                  if ep is not None else "")
+                                        cv2.putText(frame,
+                                            f"→{dst_s} {t_e:.1f}s {ep_str} {appr:.1f}m/s P={prob:.0%}",
+                                            (nx, ny + 28), cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.34, (255, 200, 100, 255), 1, cv2.LINE_AA)
 
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR))
 
@@ -1163,7 +1200,7 @@ if __name__ == "__main__":
             'transition_prob', 'transition_approach',
             'transition_time_err', 'transition_pos_err',
         ])
-        df.to_csv('fused_tracking_data.csv', index=False)
+        df.to_csv('fused_tracking_data_updated.csv', index=False)
     except Exception as e:
         print(f"Warning: CSV save failed: {e}")
 
